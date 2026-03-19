@@ -60,9 +60,38 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 FAVORITES_FILE = DATA_DIR / "favorites.json"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 
-# Speed tiers (ms)
-SPEED_FAST = 100
-SPEED_MEDIUM = 300
+# Countries close to Russia — proxies here will have lower ping for RU users
+# Priority: lower number = shown first
+_NEARBY_COUNTRIES: dict[str, int] = {
+    # CIS / ex-USSR
+    "RU": 0, "BY": 1, "KZ": 1, "AM": 1, "GE": 1, "AZ": 1,
+    "UZ": 1, "KG": 1, "TJ": 1, "MD": 1, "UA": 1,
+    # Neighbours / close EU
+    "FI": 2, "EE": 2, "LV": 2, "LT": 2, "PL": 2,
+    "DE": 3, "NL": 3, "CZ": 3, "SE": 3, "NO": 3, "AT": 3,
+    "RO": 3, "BG": 3, "HU": 3, "SK": 3,
+    # Rest of Europe
+    "FR": 4, "GB": 4, "IT": 4, "ES": 4, "CH": 4, "BE": 4,
+    "DK": 4, "PT": 4, "IE": 4, "HR": 4, "RS": 4,
+    # Middle East / Turkey
+    "TR": 3, "IR": 3, "AE": 4, "IL": 4,
+}
+_DEFAULT_PRIORITY = 8  # US, Asia, South America, unknown
+
+# Country code → flag emoji
+_FLAGS: dict[str, str] = {}
+
+
+def _country_flag(code: str) -> str:
+    """Convert 2-letter country code to flag emoji."""
+    if not code or len(code) != 2:
+        return "🌐"
+    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code.upper())
+
+
+def _geo_priority(country: str) -> int:
+    """Lower = closer to Russia = better for user."""
+    return _NEARBY_COUNTRIES.get(country.upper(), _DEFAULT_PRIORITY) if country else _DEFAULT_PRIORITY
 
 
 # ─── Data classes ──────────────────────────────────────────────────────────────
@@ -80,12 +109,9 @@ class MTProxy:
     def tme_link(self) -> str:
         return f"https://t.me/proxy?server={self.server}&port={self.port}&secret={self.secret}"
 
-    def speed_emoji(self) -> str:
-        if self.latency_ms <= SPEED_FAST:
-            return "🟢"
-        if self.latency_ms <= SPEED_MEDIUM:
-            return "🟡"
-        return "🔴"
+    @property
+    def geo_priority(self) -> int:
+        return _geo_priority(self.country)
 
     def to_dict(self) -> dict:
         return {"server": self.server, "port": self.port, "secret": self.secret}
@@ -107,13 +133,9 @@ class ProxyManager:
         elapsed = (datetime.now(timezone.utc) - self.last_refresh).total_seconds()
         return elapsed > STALE_THRESHOLD
 
-    def get_filtered(self, speed: str | None = None) -> list[MTProxy]:
-        proxies = self.valid_proxies
-        if speed == "fast":
-            proxies = [p for p in proxies if p.latency_ms <= SPEED_FAST]
-        elif speed == "medium":
-            proxies = [p for p in proxies if p.latency_ms <= SPEED_MEDIUM]
-        return proxies
+    def get_nearby(self) -> list[MTProxy]:
+        """Return proxies sorted by geographic proximity to Russia."""
+        return sorted(self.valid_proxies, key=lambda p: (p.geo_priority, p.latency_ms))
 
 
 # ─── Persistence helpers ───────────────────────────────────────────────────────
@@ -407,10 +429,10 @@ async def refresh_proxies(manager: ProxyManager) -> None:
             logger.info(f"Total unique proxies: {len(all_proxies)}, validating...")
 
             valid = await validate_batch(all_proxies)
-            valid.sort(key=lambda p: p.latency_ms)
 
-            # GeoIP enrichment on validated proxies
+            # GeoIP enrichment BEFORE sorting — sort by proximity to Russia
             await enrich_country(session, valid)
+            valid.sort(key=lambda p: (p.geo_priority, p.latency_ms))
 
         manager.valid_proxies = valid
         manager.last_refresh = datetime.now(timezone.utc)
@@ -450,10 +472,10 @@ def _proxy_key(server: str, port: int) -> str:
 
 
 def format_proxy_line(i: int, p: MTProxy) -> str:
-    emoji = p.speed_emoji()
+    flag = _country_flag(p.country) if p.country else "🌐"
     display = escape_md(f"{p.server}:{p.port}")
-    country = f" {p.country}" if p.country else ""
-    return f"{i}\\. {emoji} [{display}]({p.tme_link}) — {p.latency_ms}ms{escape_md(country)}"
+    country_label = escape_md(f" {p.country}") if p.country else ""
+    return f"{i}\\. {flag}{country_label} [{display}]({p.tme_link})"
 
 
 def format_proxy_list(proxies: list[MTProxy], last_refresh: datetime | None) -> str:
@@ -480,11 +502,11 @@ def proxy_list_keyboard(proxies: list[MTProxy]) -> InlineKeyboardMarkup:
     # Navigation
     rows.append([
         InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_refresh"),
-        InlineKeyboardButton(text="📊 Статус", callback_data="cb_status"),
+        InlineKeyboardButton(text="🔀 Другие", callback_data="cb_next"),
     ])
     rows.append([
-        InlineKeyboardButton(text="🚀 Быстрые (<100ms)", callback_data="cb_fast"),
         InlineKeyboardButton(text="⭐ Избранное", callback_data="cb_favorites"),
+        InlineKeyboardButton(text="📊 Статус", callback_data="cb_status"),
     ])
     rows.append([
         InlineKeyboardButton(text="🔔 Подписка", callback_data="cb_subscribe"),
@@ -498,11 +520,11 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_refresh"),
-            InlineKeyboardButton(text="📊 Статус", callback_data="cb_status"),
+            InlineKeyboardButton(text="🔀 Другие", callback_data="cb_next"),
         ],
         [
-            InlineKeyboardButton(text="🚀 Быстрые (<100ms)", callback_data="cb_fast"),
             InlineKeyboardButton(text="⭐ Избранное", callback_data="cb_favorites"),
+            InlineKeyboardButton(text="📊 Статус", callback_data="cb_status"),
         ],
         [
             InlineKeyboardButton(text="🔔 Подписка", callback_data="cb_subscribe"),
@@ -544,14 +566,13 @@ async def cmd_start(message: Message):
         "⚡ *MTProto Proxy Bot*\n\n"
         "Нахожу, проверяю и отдаю рабочие MTProto\\-прокси для Telegram\\.\n\n"
         "📋 *Команды:*\n"
-        "/proxy — получить 5 лучших прокси\n"
-        "/fast — только быстрые \\(<100ms\\)\n"
+        "/proxy — 5 лучших прокси \\(ближайшие к РФ\\)\n"
         "/refresh — принудительно обновить\n"
         "/status — статистика\n"
         "/subscribe — авто\\-уведомления каждые 4ч\n"
         "/unsubscribe — отключить уведомления\n"
         "/favorites — мои избранные\n\n"
-        "⭐ _Нажми кнопку 1–5 под списком прокси чтобы сохранить в избранное_\n"
+        "⭐ _Нажми кнопку 1–5 под списком прокси чтобы сохранить_\n"
         "🗑 _В избранном — кнопки удаления для каждого прокси_\n\n"
         "_Или используй кнопки ниже_ 👇"
     )
@@ -560,27 +581,17 @@ async def cmd_start(message: Message):
 
 # Store last shown proxies per chat so save buttons can find them
 _last_shown: dict[int, list[MTProxy]] = {}
+# Track offset for "show next" pagination per chat
+_page_offset: dict[int, int] = {}
 
 
-# /proxy [fast|medium]
+# /proxy
 @router.message(Command("proxy", "get"))
-async def cmd_proxy(message: Message, command: CommandObject | None = None):
-    speed_filter = None
-    if command and command.args:
-        arg = command.args.strip().lower()
-        if arg in ("fast", "medium"):
-            speed_filter = arg
-
-    await _send_proxies(message, speed_filter=speed_filter)
+async def cmd_proxy(message: Message):
+    await _send_proxies(message)
 
 
-# /fast shortcut
-@router.message(Command("fast"))
-async def cmd_fast(message: Message):
-    await _send_proxies(message, speed_filter="fast")
-
-
-async def _send_proxies(message: Message, speed_filter: str | None = None, edit: bool = False):
+async def _send_proxies(message: Message):
     if manager.is_stale() or not manager.valid_proxies:
         wait_msg = await message.answer("⏳ Загружаю свежие прокси, подожди\\.\\.\\.")
         await refresh_proxies(manager)
@@ -589,11 +600,11 @@ async def _send_proxies(message: Message, speed_filter: str | None = None, edit:
         except Exception:
             pass
 
-    proxies = manager.get_filtered(speed_filter)
+    proxies = manager.get_nearby()
+    _page_offset[message.chat.id] = 0
     if not proxies:
-        label = f" ({speed_filter})" if speed_filter else ""
         await message.answer(
-            f"Рабочих прокси{label} не найдено. Попробуй /refresh или убери фильтр.",
+            "Рабочих прокси не найдено. Попробуй /refresh",
             parse_mode=None,
         )
         return
@@ -601,9 +612,6 @@ async def _send_proxies(message: Message, speed_filter: str | None = None, edit:
     count = min(PROXIES_PER_REQUEST, len(proxies))
     selected = proxies[:count]
     text = format_proxy_list(selected, manager.last_refresh)
-
-    if speed_filter:
-        text += f"\n\n_Фильтр: {escape_md(speed_filter)}_"
 
     # Remember shown proxies so ⭐ buttons can reference them
     _last_shown[message.chat.id] = selected
@@ -646,30 +654,36 @@ async def cmd_status(message: Message):
 
 def _status_text(subs: set[int] | None = None) -> str:
     if manager.last_refresh:
-        updated = manager.last_refresh.strftime("%Y-%m-%d %H:%M UTC")
+        updated = manager.last_refresh.strftime("%Y-%m-%d %H:%M:%S UTC")
     else:
         updated = "ещё не обновлялось"
 
     total = len(manager.valid_proxies)
-    fast = len([p for p in manager.valid_proxies if p.latency_ms <= SPEED_FAST])
-    medium = len([p for p in manager.valid_proxies if p.latency_ms <= SPEED_MEDIUM])
 
-    countries = {}
+    # Count by proximity tier
+    nearby = len([p for p in manager.valid_proxies if p.geo_priority <= 2])
+    europe = len([p for p in manager.valid_proxies if p.geo_priority <= 4])
+
+    countries: dict[str, int] = {}
     for p in manager.valid_proxies:
         if p.country:
             countries[p.country] = countries.get(p.country, 0) + 1
-    top_countries = sorted(countries.items(), key=lambda x: -x[1])[:5]
-    country_str = ", ".join(f"{c}: {n}" for c, n in top_countries) if top_countries else "нет данных"
+    top_countries = sorted(countries.items(), key=lambda x: -x[1])[:7]
+    country_lines = []
+    for code, count in top_countries:
+        flag = _country_flag(code)
+        country_lines.append(f"  {flag} {code}: {count}")
+    country_str = "\n".join(country_lines) if country_lines else "  нет данных"
 
     sub_count = len(subs) if subs else 0
 
     return (
         f"📊 Статистика\n\n"
         f"Всего рабочих: {total}\n"
-        f"🟢 Быстрые (<{SPEED_FAST}ms): {fast}\n"
-        f"🟡 Средние (<{SPEED_MEDIUM}ms): {medium}\n"
-        f"🔴 Медленные: {total - medium}\n\n"
-        f"🌍 Топ стран: {country_str}\n"
+        f"🟢 Ближние (СНГ/соседи): {nearby}\n"
+        f"🟡 Европа: {europe}\n"
+        f"🌐 Остальные: {total - europe}\n\n"
+        f"🌍 По странам:\n{country_str}\n\n"
         f"📡 Источников: {len(PROXY_SOURCES_TEXT) + len(PROXY_SOURCES_API)}\n"
         f"🔔 Подписчиков: {sub_count}\n"
         f"Обновлено: {updated}"
@@ -794,11 +808,13 @@ async def cb_refresh(callback: CallbackQuery):
     await safe_edit(callback.message,"🔄 Обновляю список прокси\\.\\.\\.")
     await refresh_proxies(manager)
 
-    proxies = manager.valid_proxies[:PROXIES_PER_REQUEST]
+    chat_id = callback.message.chat.id
+    _page_offset[chat_id] = 0  # reset pagination
+    proxies = manager.get_nearby()[:PROXIES_PER_REQUEST]
     if proxies:
-        _last_shown[callback.message.chat.id] = proxies
+        _last_shown[chat_id] = proxies
         text = format_proxy_list(proxies, manager.last_refresh)
-        await safe_edit(callback.message,text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
+        await safe_edit(callback.message, text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
     else:
         await safe_edit(callback.message,
             "Рабочих прокси не найдено\\. Попробуй позже\\.",
@@ -818,18 +834,34 @@ async def cb_status(callback: CallbackQuery):
     )
 
 
-@router.callback_query(F.data == "cb_fast")
-async def cb_fast(callback: CallbackQuery):
+@router.callback_query(F.data == "cb_next")
+async def cb_next(callback: CallbackQuery):
+    """Show next batch of proxies."""
     await callback.answer()
-    proxies = manager.get_filtered("fast")
-    if not proxies:
-        await callback.answer("Нет быстрых прокси (<100ms). Попробуй обновить.", show_alert=True)
+    all_proxies = manager.get_nearby()
+    if not all_proxies:
+        await callback.answer("Нет прокси. Нажми 🔄 Обновить.", show_alert=True)
         return
-    selected = proxies[:PROXIES_PER_REQUEST]
-    _last_shown[callback.message.chat.id] = selected
+
+    chat_id = callback.message.chat.id
+    offset = _page_offset.get(chat_id, 0) + PROXIES_PER_REQUEST
+
+    # Wrap around if we've gone past the end
+    if offset >= len(all_proxies):
+        offset = 0
+    _page_offset[chat_id] = offset
+
+    selected = all_proxies[offset:offset + PROXIES_PER_REQUEST]
+    if not selected:
+        selected = all_proxies[:PROXIES_PER_REQUEST]
+        _page_offset[chat_id] = 0
+
+    _last_shown[chat_id] = selected
+    page = (offset // PROXIES_PER_REQUEST) + 1
+    total_pages = (len(all_proxies) + PROXIES_PER_REQUEST - 1) // PROXIES_PER_REQUEST
     text = format_proxy_list(selected, manager.last_refresh)
-    text += f"\n\n_Фильтр: только быстрые \\(<100ms\\)_"
-    await safe_edit(callback.message,text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
+    text += f"\n\n_Страница {page}/{total_pages}_"
+    await safe_edit(callback.message, text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "cb_favorites")
@@ -943,10 +975,12 @@ async def _cb_go_back(callback: CallbackQuery):
             reply_markup=main_keyboard(),
         )
         return
-    proxies = manager.valid_proxies[:PROXIES_PER_REQUEST]
-    _last_shown[callback.message.chat.id] = proxies
+    chat_id = callback.message.chat.id
+    _page_offset[chat_id] = 0
+    proxies = manager.get_nearby()[:PROXIES_PER_REQUEST]
+    _last_shown[chat_id] = proxies
     text = format_proxy_list(proxies, manager.last_refresh)
-    await safe_edit(callback.message,text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
+    await safe_edit(callback.message, text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "cb_back")
