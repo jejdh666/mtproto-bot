@@ -133,8 +133,22 @@ class ProxyManager:
         elapsed = (datetime.now(timezone.utc) - self.last_refresh).total_seconds()
         return elapsed > STALE_THRESHOLD
 
-    def get_nearby(self) -> list[MTProxy]:
-        """Return proxies sorted by geographic proximity to Russia."""
+    def get_nearby(self, max_priority: int = 4) -> list[MTProxy]:
+        """Return proxies filtered & sorted by geographic proximity to Russia.
+
+        max_priority filters out distant countries:
+          0 = RU only
+          1 = CIS
+          2 = CIS + neighbours (FI, Baltics, PL)
+          3 = + core Europe (DE, NL, TR, etc.)
+          4 = all Europe + Middle East  (default)
+          8+ = everything including US/Asia
+        """
+        filtered = [p for p in self.valid_proxies if p.geo_priority <= max_priority]
+        return sorted(filtered, key=lambda p: (p.geo_priority, p.latency_ms))
+
+    def get_all_sorted(self) -> list[MTProxy]:
+        """Return ALL proxies sorted by proximity (no filtering)."""
         return sorted(self.valid_proxies, key=lambda p: (p.geo_priority, p.latency_ms))
 
 
@@ -505,10 +519,11 @@ def proxy_list_keyboard(proxies: list[MTProxy]) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🔀 Другие", callback_data="cb_next"),
     ])
     rows.append([
-        InlineKeyboardButton(text="⭐ Избранное", callback_data="cb_favorites"),
+        InlineKeyboardButton(text="🌍 Все страны", callback_data="cb_all_countries"),
         InlineKeyboardButton(text="📊 Статус", callback_data="cb_status"),
     ])
     rows.append([
+        InlineKeyboardButton(text="⭐ Избранное", callback_data="cb_favorites"),
         InlineKeyboardButton(text="🔔 Подписка", callback_data="cb_subscribe"),
     ])
 
@@ -600,7 +615,12 @@ async def _send_proxies(message: Message):
         except Exception:
             pass
 
-    proxies = manager.get_nearby()
+    # Try nearby first (priority ≤ 4 = Europe/CIS/Middle East)
+    # If too few, gradually expand to all countries
+    proxies = manager.get_nearby(max_priority=4)
+    if len(proxies) < PROXIES_PER_REQUEST:
+        proxies = manager.get_all_sorted()
+
     _page_offset[message.chat.id] = 0
     if not proxies:
         await message.answer(
@@ -804,22 +824,54 @@ async def cb_refresh(callback: CallbackQuery):
         return
 
     refresh_cooldowns[user_id] = now
-    await callback.answer("Обновляю...")
-    await safe_edit(callback.message,"🔄 Обновляю список прокси\\.\\.\\.")
-    await refresh_proxies(manager)
+    await callback.answer("⏳ Обновляю, ~20 сек...")
+
+    try:
+        await safe_edit(callback.message, "🔄 Обновляю список прокси, подожди \\~20 сек\\.\\.\\.")
+    except Exception:
+        pass
+
+    try:
+        await refresh_proxies(manager)
+    except Exception as e:
+        logger.error(f"Refresh failed in callback: {e}")
+        try:
+            await safe_edit(callback.message,
+                "❌ Ошибка при обновлении\\. Попробуй позже\\.",
+                reply_markup=main_keyboard(),
+            )
+        except Exception:
+            pass
+        return
 
     chat_id = callback.message.chat.id
-    _page_offset[chat_id] = 0  # reset pagination
-    proxies = manager.get_nearby()[:PROXIES_PER_REQUEST]
-    if proxies:
-        _last_shown[chat_id] = proxies
-        text = format_proxy_list(proxies, manager.last_refresh)
-        await safe_edit(callback.message, text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
-    else:
-        await safe_edit(callback.message,
-            "Рабочих прокси не найдено\\. Попробуй позже\\.",
-            reply_markup=main_keyboard(),
-        )
+    _page_offset[chat_id] = 0
+    nearby = manager.get_nearby(max_priority=4)
+    if len(nearby) < PROXIES_PER_REQUEST:
+        nearby = manager.get_all_sorted()
+    proxies = nearby[:PROXIES_PER_REQUEST]
+
+    try:
+        if proxies:
+            _last_shown[chat_id] = proxies
+            text = format_proxy_list(proxies, manager.last_refresh)
+            await callback.message.edit_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=proxy_list_keyboard(proxies),
+                disable_web_page_preview=True,
+            )
+        else:
+            await callback.message.edit_text(
+                "Рабочих прокси не найдено\\. Попробуй позже\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=main_keyboard(),
+            )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            logger.error(f"Failed to edit after refresh: {e}")
+    except Exception as e:
+        logger.error(f"Failed to edit after refresh: {e}")
 
 
 @router.callback_query(F.data == "cb_status")
@@ -838,7 +890,9 @@ async def cb_status(callback: CallbackQuery):
 async def cb_next(callback: CallbackQuery):
     """Show next batch of proxies."""
     await callback.answer()
-    all_proxies = manager.get_nearby()
+    all_proxies = manager.get_nearby(max_priority=4)
+    if len(all_proxies) < PROXIES_PER_REQUEST:
+        all_proxies = manager.get_all_sorted()
     if not all_proxies:
         await callback.answer("Нет прокси. Нажми 🔄 Обновить.", show_alert=True)
         return
@@ -862,6 +916,39 @@ async def cb_next(callback: CallbackQuery):
     text = format_proxy_list(selected, manager.last_refresh)
     text += f"\n\n_Страница {page}/{total_pages}_"
     await safe_edit(callback.message, text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "cb_all_countries")
+async def cb_all_countries(callback: CallbackQuery):
+    """Show proxies from ALL countries (including distant ones)."""
+    await callback.answer()
+    all_proxies = manager.get_all_sorted()
+    if not all_proxies:
+        await callback.answer("Нет прокси. Нажми 🔄 Обновить.", show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id
+    _page_offset[chat_id] = 0
+    selected = all_proxies[:PROXIES_PER_REQUEST]
+    _last_shown[chat_id] = selected
+
+    text = "🌍 *Все прокси \\(включая далёкие\\):*\n\n"
+    text += "\n".join(format_proxy_line(i, p) for i, p in enumerate(selected, 1))
+    if manager.last_refresh:
+        updated = manager.last_refresh.strftime("%H:%M:%S UTC")
+        text += f"\n\n_Обновлено: {escape_md(updated)}_"
+    text += "\n\n⚠️ _Далёкие прокси могут быть заблокированы провайдером_"
+
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=proxy_list_keyboard(selected),
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            logger.error(f"Failed to show all countries: {e}")
 
 
 @router.callback_query(F.data == "cb_favorites")
@@ -977,7 +1064,10 @@ async def _cb_go_back(callback: CallbackQuery):
         return
     chat_id = callback.message.chat.id
     _page_offset[chat_id] = 0
-    proxies = manager.get_nearby()[:PROXIES_PER_REQUEST]
+    proxies = manager.get_nearby(max_priority=4)
+    if len(proxies) < PROXIES_PER_REQUEST:
+        proxies = manager.get_all_sorted()
+    proxies = proxies[:PROXIES_PER_REQUEST]
     _last_shown[chat_id] = proxies
     text = format_proxy_list(proxies, manager.last_refresh)
     await safe_edit(callback.message, text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
