@@ -31,12 +31,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ─── Sources ───────────────────────────────────────────────────────────────────
-PROXY_SOURCES = [
+# Only verified, actively maintained sources:
+#
+# 1. SoliSpirit/mtproto — 465⭐, auto-updated every 12h, proxies pre-verified
+# 2. Argh94/Proxy-List  — auto-updated every 2-4h, 1000+ proxies, large list
+# 3. mtpro.xyz API      — referenced by hookzof (924⭐), updates every 5 min
+#
+PROXY_SOURCES_TEXT = [
     "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
-    "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
-    "https://raw.githubusercontent.com/MrMohewormo/MTProtoProxies/master/proxies.txt",
-    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/mtproto.txt",
+    "https://raw.githubusercontent.com/Argh94/Proxy-List/main/MTProto.txt",
+]
+PROXY_SOURCES_API = [
+    "https://mtpro.xyz/api/otherproxies",
 ]
 
 # ─── Config ────────────────────────────────────────────────────────────────────
@@ -180,25 +186,14 @@ def parse_proxy_json(data: list | dict) -> list[MTProxy]:
 
 # ─── Fetching ──────────────────────────────────────────────────────────────────
 
-async def fetch_proxies_from_source(session: aiohttp.ClientSession, url: str) -> list[MTProxy]:
+async def fetch_text_source(session: aiohttp.ClientSession, url: str) -> list[MTProxy]:
+    """Fetch proxies from a text file (one tg://proxy or https://t.me/proxy link per line)."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
                 logger.warning(f"Failed to fetch {url}: HTTP {resp.status}")
                 return []
             text = await resp.text()
-
-            # JSON source
-            if url.endswith(".json"):
-                try:
-                    data = json.loads(text)
-                    proxies = parse_proxy_json(data)
-                    logger.info(f"Fetched {len(proxies)} proxies from {url} (JSON)")
-                    return proxies
-                except json.JSONDecodeError:
-                    pass
-
-            # Text/URL source
             proxies = []
             for line in text.splitlines():
                 proxy = parse_proxy_url(line)
@@ -211,15 +206,53 @@ async def fetch_proxies_from_source(session: aiohttp.ClientSession, url: str) ->
         return []
 
 
+async def fetch_api_source(session: aiohttp.ClientSession, url: str) -> list[MTProxy]:
+    """Fetch proxies from mtpro.xyz JSON API."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                logger.warning(f"Failed to fetch API {url}: HTTP {resp.status}")
+                return []
+            data = await resp.json(content_type=None)
+            proxies = parse_proxy_json(data)
+            logger.info(f"Fetched {len(proxies)} proxies from API {url}")
+            return proxies
+    except Exception as e:
+        logger.error(f"Error fetching API {url}: {e}")
+        return []
+
+
 # ─── Validation ────────────────────────────────────────────────────────────────
+
+# Suspicious patterns — these are web servers, not MTProto proxies
+_SUSPICIOUS_HOSTNAMES = {"http.", "https.", "www.", "api.", "cdn."}
+
+
+def _is_suspicious_host(server: str) -> bool:
+    """Filter out hosts that are obviously web servers, not MTProto proxies."""
+    lower = server.lower()
+    for prefix in _SUSPICIOUS_HOSTNAMES:
+        if lower.startswith(prefix):
+            return True
+    return False
+
 
 async def validate_proxy(proxy: MTProxy, timeout: float = VALIDATE_TIMEOUT) -> bool:
     """
-    Deep validation: TCP connect + MTProto TLS handshake probe.
-    Sends a fake TLS ClientHello-like packet and checks if the server responds
-    (real MTProto proxies respond, random TCP services usually don't).
+    Three-stage validation:
+      1) Hostname sanity check — reject obvious web servers
+      2) TCP connect — measure latency
+      3) HTTP probe — send an HTTP GET; real MTProto proxies will NOT reply
+         with HTTP. If we get an HTTP response, it's a web server → reject.
     """
+    # Stage 1: hostname filter
+    if _is_suspicious_host(proxy.server):
+        logger.debug(f"Skipping suspicious host: {proxy.server}")
+        proxy.is_valid = False
+        return False
+
     try:
+        # Stage 2: TCP connect
         start = time.monotonic()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(proxy.server, proxy.port),
@@ -227,29 +260,51 @@ async def validate_proxy(proxy: MTProxy, timeout: float = VALIDATE_TIMEOUT) -> b
         )
         proxy.latency_ms = int((time.monotonic() - start) * 1000)
 
-        # Deeper check: send a small probe and see if the server responds
-        # MTProto proxies expect a specific handshake; we send random bytes
-        # and check that the connection stays alive (doesn't immediately RST)
+        # Stage 3: HTTP probe — send a minimal HTTP request
+        # Real MTProto proxy will either:
+        #   a) ignore it / not respond (timeout) — GOOD
+        #   b) close connection — GOOD (still likely MTProto)
+        # Web server / random service will:
+        #   a) respond with "HTTP/" — BAD, it's a web server
         try:
-            probe = os.urandom(64)
-            writer.write(probe)
+            http_probe = b"GET / HTTP/1.0\r\nHost: check\r\n\r\n"
+            writer.write(http_probe)
             await writer.drain()
-            # If we can read *anything* back (or timeout after 1.5s), proxy is alive
+
             try:
-                await asyncio.wait_for(reader.read(1), timeout=1.5)
+                response = await asyncio.wait_for(reader.read(512), timeout=2.0)
+                # If server responds with HTTP, it's NOT an MTProto proxy
+                if response and (
+                    response[:4] == b"HTTP"
+                    or b"<html" in response[:200].lower()
+                    or b"<!doc" in response[:200].lower()
+                    or b"text/html" in response[:200].lower()
+                    or b"nginx" in response[:200].lower()
+                    or b"apache" in response[:200].lower()
+                ):
+                    logger.debug(f"HTTP response detected, not MTProto: {proxy.server}:{proxy.port}")
+                    proxy.is_valid = False
+                    writer.close()
+                    await writer.wait_closed()
+                    return False
+                # Got non-HTTP binary response — likely MTProto, that's fine
             except asyncio.TimeoutError:
-                pass  # timeout is fine — proxy is alive but didn't respond to junk
+                pass  # No response to HTTP = good, likely MTProto proxy
+
         except (OSError, ConnectionError):
-            proxy.is_valid = False
+            # Connection reset after probe — this is actually fine for MTProto
+            pass
+
+        try:
             writer.close()
             await writer.wait_closed()
-            return False
+        except (OSError, ConnectionError):
+            pass
 
-        writer.close()
-        await writer.wait_closed()
         proxy.is_valid = True
         return True
-    except (OSError, asyncio.TimeoutError, OverflowError):
+
+    except (OSError, asyncio.TimeoutError, OverflowError, ConnectionError):
         proxy.is_valid = False
         return False
 
@@ -307,9 +362,14 @@ async def refresh_proxies(manager: ProxyManager) -> None:
         logger.info("Refreshing proxy list...")
         all_proxies: list[MTProxy] = []
         async with aiohttp.ClientSession() as session:
-            results = await asyncio.gather(
-                *(fetch_proxies_from_source(session, url) for url in PROXY_SOURCES)
-            )
+            # Fetch from text sources and API sources in parallel
+            tasks = []
+            for url in PROXY_SOURCES_TEXT:
+                tasks.append(fetch_text_source(session, url))
+            for url in PROXY_SOURCES_API:
+                tasks.append(fetch_api_source(session, url))
+
+            results = await asyncio.gather(*tasks)
             for batch in results:
                 all_proxies.extend(batch)
 
@@ -511,7 +571,7 @@ def _status_text(subs: set[int] | None = None) -> str:
         f"🟡 Средние (<{SPEED_MEDIUM}ms): {medium}\n"
         f"🔴 Медленные: {total - medium}\n\n"
         f"🌍 Топ стран: {country_str}\n"
-        f"📡 Источников: {len(PROXY_SOURCES)}\n"
+        f"📡 Источников: {len(PROXY_SOURCES_TEXT) + len(PROXY_SOURCES_API)}\n"
         f"🔔 Подписчиков: {sub_count}\n"
         f"Обновлено: {updated}"
     )
