@@ -401,6 +401,13 @@ def escape_md(text: str) -> str:
     return "".join(result)
 
 
+def _proxy_key(server: str, port: int) -> str:
+    """Short unique key for callback data (max 64 bytes in Telegram)."""
+    import hashlib
+    raw = f"{server}:{port}"
+    return hashlib.md5(raw.encode()).hexdigest()[:10]
+
+
 def format_proxy_line(i: int, p: MTProxy) -> str:
     emoji = p.speed_emoji()
     display = escape_md(f"{p.server}:{p.port}")
@@ -416,7 +423,37 @@ def format_proxy_list(proxies: list[MTProxy], last_refresh: datetime | None) -> 
     return text
 
 
+def proxy_list_keyboard(proxies: list[MTProxy]) -> InlineKeyboardMarkup:
+    """Keyboard with a ⭐ save button per proxy + navigation."""
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Save buttons row — one per proxy
+    save_buttons = []
+    for i, p in enumerate(proxies, 1):
+        key = _proxy_key(p.server, p.port)
+        save_buttons.append(
+            InlineKeyboardButton(text=f"⭐ {i}", callback_data=f"save:{key}")
+        )
+    rows.append(save_buttons)
+
+    # Navigation
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_refresh"),
+        InlineKeyboardButton(text="📊 Статус", callback_data="cb_status"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🚀 Быстрые (<100ms)", callback_data="cb_fast"),
+        InlineKeyboardButton(text="⭐ Избранное", callback_data="cb_favorites"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🔔 Подписка", callback_data="cb_subscribe"),
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def main_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard without save buttons (for non-proxy-list messages)."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_refresh"),
@@ -432,10 +469,23 @@ def main_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def favorites_keyboard(proxies_count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="« Назад", callback_data="cb_back")],
+def favorites_keyboard(proxies: list[MTProxy]) -> InlineKeyboardMarkup:
+    """Keyboard with 🗑 delete buttons per favorite + clear all."""
+    rows: list[list[InlineKeyboardButton]] = []
+
+    del_buttons = []
+    for i, p in enumerate(proxies, 1):
+        key = _proxy_key(p.server, p.port)
+        del_buttons.append(
+            InlineKeyboardButton(text=f"🗑 {i}", callback_data=f"delfav:{key}")
+        )
+    rows.append(del_buttons)
+    rows.append([
+        InlineKeyboardButton(text="🗑 Очистить всё", callback_data="cb_clearfavs"),
+        InlineKeyboardButton(text="« Назад", callback_data="cb_back"),
     ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ─── Bot setup ─────────────────────────────────────────────────────────────────
@@ -459,11 +509,16 @@ async def cmd_start(message: Message):
         "/status — статистика\n"
         "/subscribe — авто\\-уведомления каждые 4ч\n"
         "/unsubscribe — отключить уведомления\n"
-        "/save — сохранить прокси в избранное\n"
         "/favorites — мои избранные\n\n"
+        "⭐ _Нажми кнопку 1–5 под списком прокси чтобы сохранить в избранное_\n"
+        "🗑 _В избранном — кнопки удаления для каждого прокси_\n\n"
         "_Или используй кнопки ниже_ 👇"
     )
     await message.answer(text, reply_markup=main_keyboard(), disable_web_page_preview=True)
+
+
+# Store last shown proxies per chat so save buttons can find them
+_last_shown: dict[int, list[MTProxy]] = {}
 
 
 # /proxy [fast|medium]
@@ -509,7 +564,10 @@ async def _send_proxies(message: Message, speed_filter: str | None = None, edit:
     if speed_filter:
         text += f"\n\n_Фильтр: {escape_md(speed_filter)}_"
 
-    await message.answer(text, reply_markup=main_keyboard(), disable_web_page_preview=True)
+    # Remember shown proxies so ⭐ buttons can reference them
+    _last_shown[message.chat.id] = selected
+
+    await message.answer(text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
 
 
 # /refresh
@@ -610,75 +668,61 @@ async def cmd_unsubscribe(message: Message):
 
 # ─── Favorites ─────────────────────────────────────────────────────────────────
 
-@router.message(Command("save"))
-async def cmd_save(message: Message, command: CommandObject | None = None):
-    """Save top N proxies to favorites. Usage: /save or /save 3"""
-    n = 1
-    if command and command.args:
-        try:
-            n = max(1, min(int(command.args.strip()), 10))
-        except ValueError:
-            pass
-
-    if not manager.valid_proxies:
-        await message.answer("Нет прокси для сохранения. Сначала /proxy", parse_mode=None)
-        return
-
-    favs = load_favorites()
-    uid = str(message.from_user.id)
-    user_favs = favs.get(uid, [])
-
-    existing_keys = {(f["server"], f["port"]) for f in user_favs}
-    added = 0
-    for p in manager.valid_proxies[:n]:
-        key = (p.server, p.port)
-        if key not in existing_keys:
-            user_favs.append(p.to_dict())
-            existing_keys.add(key)
-            added += 1
-
-    # Keep max 20 favorites
-    user_favs = user_favs[-20:]
-    favs[uid] = user_favs
-    save_favorites(favs)
-
-    await message.answer(
-        f"⭐ Сохранено {added} прокси в избранное (всего: {len(user_favs)}/20)\n"
-        f"Посмотреть: /favorites",
-        parse_mode=None,
-    )
-
-
 @router.message(Command("favorites", "favs"))
 async def cmd_favorites(message: Message):
+    await _show_favorites(message)
+
+
+async def _show_favorites(target: Message | CallbackQuery):
+    """Show favorites — works from both /favorites command and ⭐ button."""
+    if isinstance(target, CallbackQuery):
+        uid = str(target.from_user.id)
+    else:
+        uid = str(target.from_user.id)
+
     favs = load_favorites()
-    uid = str(message.from_user.id)
     user_favs = favs.get(uid, [])
 
     if not user_favs:
-        await message.answer(
-            "У тебя нет избранных прокси.\n"
-            "Используй /save после /proxy чтобы сохранить лучшие.",
-            parse_mode=None,
-        )
+        text = "У тебя пока нет избранных прокси\\.\n\nНажми ⭐ 1–5 под списком прокси чтобы сохранить\\."
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, reply_markup=main_keyboard())
+        else:
+            await target.answer(text, reply_markup=main_keyboard())
         return
 
-    # Re-validate favorites quickly
+    # Re-validate favorites
     proxies = [MTProxy.from_dict(d) for d in user_favs]
     valid = await validate_batch(proxies)
 
-    if not valid:
-        await message.answer(
-            "😕 Ни один из избранных прокси сейчас не работает.\n"
-            "Используй /proxy для поиска новых, затем /save",
-            parse_mode=None,
-        )
-        return
+    all_proxies = proxies  # keep all for delete buttons
+    if valid:
+        valid.sort(key=lambda p: p.latency_ms)
 
-    valid.sort(key=lambda p: p.latency_ms)
-    lines = [format_proxy_line(i, p) for i, p in enumerate(valid, 1)]
-    text = f"⭐ *Избранные прокси* \\({len(valid)}/{len(user_favs)} работают\\):\n\n" + "\n".join(lines)
-    await message.answer(text, reply_markup=favorites_keyboard(len(valid)), disable_web_page_preview=True)
+    # Show all saved (mark dead ones)
+    lines = []
+    display_proxies = []
+    for i, d in enumerate(user_favs, 1):
+        p = MTProxy.from_dict(d)
+        # check if this one is in valid list
+        is_alive = any(v.server == p.server and v.port == p.port for v in valid)
+        if is_alive:
+            matched = next(v for v in valid if v.server == p.server and v.port == p.port)
+            lines.append(format_proxy_line(i, matched))
+        else:
+            display = escape_md(f"{p.server}:{p.port}")
+            lines.append(f"{i}\\. ❌ [{display}]({p.tme_link}) — не работает")
+        display_proxies.append(p)
+
+    working = len(valid)
+    total = len(user_favs)
+    text = f"⭐ *Избранные прокси* \\({working}/{total} работают\\):\n\n" + "\n".join(lines)
+
+    kb = favorites_keyboard(display_proxies)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    else:
+        await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.message(Command("delfav", "clearfav"))
@@ -711,8 +755,9 @@ async def cb_refresh(callback: CallbackQuery):
 
     proxies = manager.valid_proxies[:PROXIES_PER_REQUEST]
     if proxies:
+        _last_shown[callback.message.chat.id] = proxies
         text = format_proxy_list(proxies, manager.last_refresh)
-        await callback.message.edit_text(text, reply_markup=main_keyboard(), disable_web_page_preview=True)
+        await callback.message.edit_text(text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
     else:
         await callback.message.edit_text(
             "Рабочих прокси не найдено\\. Попробуй позже\\.",
@@ -740,38 +785,99 @@ async def cb_fast(callback: CallbackQuery):
         await callback.answer("Нет быстрых прокси (<100ms). Попробуй обновить.", show_alert=True)
         return
     selected = proxies[:PROXIES_PER_REQUEST]
+    _last_shown[callback.message.chat.id] = selected
     text = format_proxy_list(selected, manager.last_refresh)
     text += f"\n\n_Фильтр: только быстрые \\(<100ms\\)_"
-    await callback.message.edit_text(text, reply_markup=main_keyboard(), disable_web_page_preview=True)
+    await callback.message.edit_text(text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "cb_favorites")
 async def cb_favorites(callback: CallbackQuery):
     await callback.answer()
-    favs = load_favorites()
+    await _show_favorites(callback)
+
+
+# ⭐ Save a specific proxy from the list
+@router.callback_query(F.data.startswith("save:"))
+async def cb_save_proxy(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    chat_id = callback.message.chat.id
+    shown = _last_shown.get(chat_id, [])
+
+    # Find the proxy by hash key
+    target = None
+    for p in shown:
+        if _proxy_key(p.server, p.port) == key:
+            target = p
+            break
+
+    if not target:
+        await callback.answer("Прокси не найден. Обнови список.", show_alert=True)
+        return
+
     uid = str(callback.from_user.id)
+    favs = load_favorites()
     user_favs = favs.get(uid, [])
 
-    if not user_favs:
-        await callback.answer("Нет избранных. Используй /save", show_alert=True)
+    # Check duplicate
+    for f in user_favs:
+        if f["server"] == target.server and f["port"] == target.port:
+            await callback.answer("Уже в избранном!", show_alert=False)
+            return
+
+    if len(user_favs) >= 20:
+        await callback.answer("Максимум 20 избранных. Удали старые.", show_alert=True)
         return
 
-    proxies = [MTProxy.from_dict(d) for d in user_favs]
-    valid = await validate_batch(proxies)
-    if not valid:
-        await callback.answer("Избранные прокси сейчас не работают 😕", show_alert=True)
+    user_favs.append(target.to_dict())
+    favs[uid] = user_favs
+    save_favorites(favs)
+    await callback.answer(f"⭐ Сохранено: {target.server}:{target.port}", show_alert=False)
+
+
+# 🗑 Delete a specific proxy from favorites
+@router.callback_query(F.data.startswith("delfav:"))
+async def cb_del_fav(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    uid = str(callback.from_user.id)
+    favs = load_favorites()
+    user_favs = favs.get(uid, [])
+
+    # Find and remove
+    new_favs = []
+    removed = False
+    for f in user_favs:
+        if _proxy_key(f["server"], f["port"]) == key and not removed:
+            removed = True
+            continue
+        new_favs.append(f)
+
+    if not removed:
+        await callback.answer("Не найдено.", show_alert=False)
         return
 
-    valid.sort(key=lambda p: p.latency_ms)
-    lines = [format_proxy_line(i, p) for i, p in enumerate(valid, 1)]
-    text = f"⭐ *Избранные прокси* \\({len(valid)}/{len(user_favs)} работают\\):\n\n" + "\n".join(lines)
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад", callback_data="cb_back")],
-        ]),
-        disable_web_page_preview=True,
-    )
+    favs[uid] = new_favs
+    save_favorites(favs)
+    await callback.answer("🗑 Удалено из избранного", show_alert=False)
+
+    # Refresh the favorites view
+    await _show_favorites(callback)
+
+
+# 🗑 Clear all favorites
+@router.callback_query(F.data == "cb_clearfavs")
+async def cb_clear_favs(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    favs = load_favorites()
+    if uid in favs and favs[uid]:
+        del favs[uid]
+        save_favorites(favs)
+        await callback.answer("🗑 Избранное очищено", show_alert=True)
+    else:
+        await callback.answer("Избранное уже пусто", show_alert=False)
+
+    # Go back to proxy list
+    await _cb_go_back(callback)
 
 
 @router.callback_query(F.data == "cb_subscribe")
@@ -788,9 +894,8 @@ async def cb_subscribe(callback: CallbackQuery):
         await callback.answer("🔔 Подписка оформлена! Уведомления каждые 4ч", show_alert=True)
 
 
-@router.callback_query(F.data == "cb_back")
-async def cb_back(callback: CallbackQuery):
-    await callback.answer()
+async def _cb_go_back(callback: CallbackQuery):
+    """Shared logic: go back to proxy list."""
     if not manager.valid_proxies:
         await callback.message.edit_text(
             "Прокси ещё не загружены\\. Нажми 🔄 Обновить\\.",
@@ -798,8 +903,15 @@ async def cb_back(callback: CallbackQuery):
         )
         return
     proxies = manager.valid_proxies[:PROXIES_PER_REQUEST]
+    _last_shown[callback.message.chat.id] = proxies
     text = format_proxy_list(proxies, manager.last_refresh)
-    await callback.message.edit_text(text, reply_markup=main_keyboard(), disable_web_page_preview=True)
+    await callback.message.edit_text(text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "cb_back")
+async def cb_back(callback: CallbackQuery):
+    await callback.answer()
+    await _cb_go_back(callback)
 
 
 # ─── Background tasks ─────────────────────────────────────────────────────────
