@@ -18,6 +18,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -389,6 +390,17 @@ async def refresh_proxies(manager: ProxyManager) -> None:
 
 # ─── Formatting helpers ───────────────────────────────────────────────────────
 
+async def safe_edit(message: Message, text: str, **kwargs):
+    """Edit message, silently ignoring 'message is not modified' error."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            pass  # same content, ignore
+        else:
+            raise
+
+
 def escape_md(text: str) -> str:
     """Escape MarkdownV2 special characters."""
     specials = r"_*[]()~`>#+-=|{}.!\\"
@@ -417,7 +429,7 @@ def format_proxy_line(i: int, p: MTProxy) -> str:
 
 def format_proxy_list(proxies: list[MTProxy], last_refresh: datetime | None) -> str:
     lines = [format_proxy_line(i, p) for i, p in enumerate(proxies, 1)]
-    updated = last_refresh.strftime("%H:%M UTC") if last_refresh else "?"
+    updated = last_refresh.strftime("%H:%M:%S UTC") if last_refresh else "?"
     text = "⚡ *Рабочие MTProto прокси:*\n\n" + "\n".join(lines)
     text += f"\n\n_Обновлено: {escape_md(updated)}_"
     return text
@@ -686,7 +698,7 @@ async def _show_favorites(target: Message | CallbackQuery):
     if not user_favs:
         text = "У тебя пока нет избранных прокси\\.\n\nНажми ⭐ 1–5 под списком прокси чтобы сохранить\\."
         if isinstance(target, CallbackQuery):
-            await target.message.edit_text(text, reply_markup=main_keyboard())
+            await safe_edit(target.message,text, reply_markup=main_keyboard())
         else:
             await target.answer(text, reply_markup=main_keyboard())
         return
@@ -720,7 +732,7 @@ async def _show_favorites(target: Message | CallbackQuery):
 
     kb = favorites_keyboard(display_proxies)
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        await safe_edit(target.message,text, reply_markup=kb, disable_web_page_preview=True)
     else:
         await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
@@ -750,16 +762,16 @@ async def cb_refresh(callback: CallbackQuery):
 
     refresh_cooldowns[user_id] = now
     await callback.answer("Обновляю...")
-    await callback.message.edit_text("🔄 Обновляю список прокси\\.\\.\\.")
+    await safe_edit(callback.message,"🔄 Обновляю список прокси\\.\\.\\.")
     await refresh_proxies(manager)
 
     proxies = manager.valid_proxies[:PROXIES_PER_REQUEST]
     if proxies:
         _last_shown[callback.message.chat.id] = proxies
         text = format_proxy_list(proxies, manager.last_refresh)
-        await callback.message.edit_text(text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
+        await safe_edit(callback.message,text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
     else:
-        await callback.message.edit_text(
+        await safe_edit(callback.message,
             "Рабочих прокси не найдено\\. Попробуй позже\\.",
             reply_markup=main_keyboard(),
         )
@@ -769,7 +781,7 @@ async def cb_refresh(callback: CallbackQuery):
 async def cb_status(callback: CallbackQuery):
     subs = load_subscribers()
     await callback.answer()
-    await callback.message.edit_text(
+    await safe_edit(callback.message,
         escape_md(_status_text(subs)),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Назад к прокси", callback_data="cb_back")],
@@ -788,7 +800,7 @@ async def cb_fast(callback: CallbackQuery):
     _last_shown[callback.message.chat.id] = selected
     text = format_proxy_list(selected, manager.last_refresh)
     text += f"\n\n_Фильтр: только быстрые \\(<100ms\\)_"
-    await callback.message.edit_text(text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
+    await safe_edit(callback.message,text, reply_markup=proxy_list_keyboard(selected), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "cb_favorites")
@@ -897,7 +909,7 @@ async def cb_subscribe(callback: CallbackQuery):
 async def _cb_go_back(callback: CallbackQuery):
     """Shared logic: go back to proxy list."""
     if not manager.valid_proxies:
-        await callback.message.edit_text(
+        await safe_edit(callback.message,
             "Прокси ещё не загружены\\. Нажми 🔄 Обновить\\.",
             reply_markup=main_keyboard(),
         )
@@ -905,7 +917,7 @@ async def _cb_go_back(callback: CallbackQuery):
     proxies = manager.valid_proxies[:PROXIES_PER_REQUEST]
     _last_shown[callback.message.chat.id] = proxies
     text = format_proxy_list(proxies, manager.last_refresh)
-    await callback.message.edit_text(text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
+    await safe_edit(callback.message,text, reply_markup=proxy_list_keyboard(proxies), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "cb_back")
