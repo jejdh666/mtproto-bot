@@ -240,11 +240,14 @@ def _is_suspicious_host(server: str) -> bool:
 
 async def validate_proxy(proxy: MTProxy, timeout: float = VALIDATE_TIMEOUT) -> bool:
     """
-    Three-stage validation:
+    Four-stage validation:
       1) Hostname sanity check — reject obvious web servers
-      2) TCP connect — measure latency
-      3) HTTP probe — send an HTTP GET; real MTProto proxies will NOT reply
-         with HTTP. If we get an HTTP response, it's a web server → reject.
+      2) TCP connect — measure latency, reject suspiciously fast (<5ms)
+      3) Unsolicited data check — real MTProto proxies WAIT for the client,
+         they never send data first. If the server pushes data immediately,
+         it's not MTProto (e.g. SSH banner, SMTP greeting, etc.) → reject.
+      4) HTTP probe — send an HTTP GET; if the server responds with HTTP,
+         it's a web server → reject.
     """
     # Stage 1: hostname filter
     if _is_suspicious_host(proxy.server):
@@ -253,7 +256,7 @@ async def validate_proxy(proxy: MTProxy, timeout: float = VALIDATE_TIMEOUT) -> b
         return False
 
     try:
-        # Stage 2: TCP connect
+        # Stage 2: TCP connect + latency check
         start = time.monotonic()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(proxy.server, proxy.port),
@@ -261,12 +264,36 @@ async def validate_proxy(proxy: MTProxy, timeout: float = VALIDATE_TIMEOUT) -> b
         )
         proxy.latency_ms = int((time.monotonic() - start) * 1000)
 
-        # Stage 3: HTTP probe — send a minimal HTTP request
-        # Real MTProto proxy will either:
-        #   a) ignore it / not respond (timeout) — GOOD
-        #   b) close connection — GOOD (still likely MTProto)
-        # Web server / random service will:
-        #   a) respond with "HTTP/" — BAD, it's a web server
+        # Reject suspiciously fast connections (<5ms) — no real internet
+        # proxy responds that fast, it's a load balancer / open port / honeypot
+        if proxy.latency_ms < 5:
+            logger.debug(f"Suspiciously fast ({proxy.latency_ms}ms), rejecting: {proxy.server}:{proxy.port}")
+            proxy.is_valid = False
+            writer.close()
+            await writer.wait_closed()
+            return False
+
+        # Stage 3: check for unsolicited data
+        # Real MTProto proxies are silent — they wait for the client to
+        # initiate the handshake. Services like SSH, SMTP, FTP, game servers
+        # send a banner/greeting immediately → reject.
+        try:
+            unsolicited = await asyncio.wait_for(reader.read(256), timeout=1.5)
+            if unsolicited:
+                logger.debug(
+                    f"Unsolicited data ({len(unsolicited)}b), not MTProto: "
+                    f"{proxy.server}:{proxy.port}"
+                )
+                proxy.is_valid = False
+                writer.close()
+                await writer.wait_closed()
+                return False
+        except asyncio.TimeoutError:
+            pass  # No unsolicited data = good, expected for MTProto
+
+        # Stage 4: HTTP probe
+        # Send a minimal HTTP request. Real MTProto proxies will NOT reply
+        # with HTTP. If we get an HTTP response → it's a web server → reject.
         try:
             http_probe = b"GET / HTTP/1.0\r\nHost: check\r\n\r\n"
             writer.write(http_probe)
@@ -274,26 +301,28 @@ async def validate_proxy(proxy: MTProxy, timeout: float = VALIDATE_TIMEOUT) -> b
 
             try:
                 response = await asyncio.wait_for(reader.read(512), timeout=2.0)
-                # If server responds with HTTP, it's NOT an MTProto proxy
-                if response and (
-                    response[:4] == b"HTTP"
-                    or b"<html" in response[:200].lower()
-                    or b"<!doc" in response[:200].lower()
-                    or b"text/html" in response[:200].lower()
-                    or b"nginx" in response[:200].lower()
-                    or b"apache" in response[:200].lower()
-                ):
-                    logger.debug(f"HTTP response detected, not MTProto: {proxy.server}:{proxy.port}")
-                    proxy.is_valid = False
-                    writer.close()
-                    await writer.wait_closed()
-                    return False
-                # Got non-HTTP binary response — likely MTProto, that's fine
+                if response:
+                    resp_lower = response[:256].lower()
+                    if (
+                        response[:4] == b"HTTP"
+                        or b"<html" in resp_lower
+                        or b"<!doc" in resp_lower
+                        or b"text/html" in resp_lower
+                        or b"nginx" in resp_lower
+                        or b"apache" in resp_lower
+                        or b"server:" in resp_lower
+                        or b"content-type" in resp_lower
+                    ):
+                        logger.debug(f"HTTP response detected: {proxy.server}:{proxy.port}")
+                        proxy.is_valid = False
+                        writer.close()
+                        await writer.wait_closed()
+                        return False
             except asyncio.TimeoutError:
-                pass  # No response to HTTP = good, likely MTProto proxy
+                pass  # No HTTP response = good, likely MTProto
 
         except (OSError, ConnectionError):
-            # Connection reset after probe — this is actually fine for MTProto
+            # Connection reset after probe — fine for MTProto
             pass
 
         try:
